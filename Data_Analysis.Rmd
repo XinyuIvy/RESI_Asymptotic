@@ -1,0 +1,704 @@
+---
+title: "Data Analysis for RESI Asymptotic Distribution Paper"
+author: "Xinyu Zhang"
+date: \today
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+
+library(readxl); library(tidyverse); library(dplyr)
+library(tidyr);  library(RESI);      library(splines)
+library(purrr);  library(knitr);     library(kableExtra)
+library(stringr);library(brglm2);    library(table1)
+library(emmeans); library(geepack);  library(ggplot2)
+
+select <- dplyr::select
+
+setwd("/media/disk2/asymptotic_resi")
+source("test/resiPEse_Th1.R") # total derivative, theta = (phi, alpha, beta)
+source("test/resi_a_geeglm.R") 
+source("functions.R")
+```
+
+# Depression analysis
+
+Results from Blythe's paper:
+
+Autistic youth had elevated depression scores compared to TD peers (p \< 0.001) and females were higher than males in both groups (p = 0.001). There was significant diagnosis by age (p \< 0.001) and diagnosis by pubertal stage (p \< 0.05) interactions. In the ASD group, elevated depressive scores presented in early adolescence and decreased during middle adolescence and puberty, whereas the TD group showed the opposite trend with an increase in depression symptoms with advancing development.
+
+```{r}
+# Read datasets
+data <- read_excel("CDI/CDI Depression Study Y1-4.xlsx")
+
+# Reshape to a long data
+long_data <- data %>%
+  pivot_longer(
+    cols = matches("^y[1-4]_"),                
+    names_to = c("year", ".value"),            
+    names_pattern = "^y(\\d+)_(.*)$"           
+  ) %>%
+  mutate(
+    year = as.integer(year)
+  ) %>%
+  arrange(record_id, year) %>%
+  group_by(record_id) %>%
+  mutate(
+    baseline_age = first(na.omit(age))
+  ) %>%
+  ungroup()
+
+y1_data <- long_data %>% filter(year == 1) %>%
+  mutate(sex = factor(sex, levels = c(1,2), labels = c("Male", "Female")),
+         race = as.factor(race),
+         ethnicity = as.factor(ethnicity)) %>%
+  select(record_id, retained, diagnosis, age, sex, ethnicity, race, 
+         gb_stage, ph_stage, cdi_emotional_tscore,
+         cdi_functional_tscore,cdi_total_tscore)
+```
+
+## Table 1
+
+During Year 1, the sample included 244 youth 10-to-13 years: 140 in the ASD group (36 females) and 104 in the TD group (46 females).
+
+```{r}
+table1(~ age + sex + ethnicity + race + gb_stage + ph_stage + cdi_emotional_tscore + cdi_functional_tscore + cdi_total_tscore| diagnosis, data = y1_data, overall = F) %>%
+  kable(format = "latex")
+```
+
+
+## Logistic model {.tabset}
+
+Total T-scores $\ge$ 65 indicate clinical depressive symptoms and can be classified as a binary outcome which is consistent with a diagnosis of depression.
+
+Model: **binary_cdi \~ diagnosis \* ns(age,3) + sex**
+
+### Parametric Covariance
+
+```{r}
+y1_data <- y1_data %>% mutate(
+  binary_cdi = as.factor(ifelse(cdi_total_tscore >= 65, 1, 0)),
+  diagnosis = as.factor(diagnosis)
+)
+# with(y1_data, table(binary_cdi, diagnosis, sex))
+
+model_log <- glm(binary_cdi ~ diagnosis * ns(age,3) + sex, data = y1_data, family = binomial)
+
+time_asy_log_const <- system.time({
+  results_asy_log_const <- resiPEse(model_log, type = "const")
+})
+
+# resi_megan <- resi_pe(model_log, vcovfunc = vcov, unbiased = TRUE)
+
+time_boot_log_const <- system.time({
+  results_boot_log_const <- resi(model_log, vcovfunc = vcov, data = y1_data, 
+                       unbiased = TRUE)
+})
+```
+
+
+#### ANOVA
+
+```{r}
+results_asy_log_const$anova %>% 
+  cbind(., results_boot_log_const$anova$RESI, results_boot_log_const$anova$`2.5%`,
+        results_boot_log_const$anova$`97.5%`, results_boot_log_const$anova$`Pr(>Chisq)`) %>%
+  as.data.frame() %>%
+  `colnames<-`(c(names(results_asy_log_const$anova), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "ccccccccc",  digits = 4) %>%
+  column_spec(3:4, background = "lightyellow") %>%  
+  column_spec(6:7, background = "lightblue") %>%  
+  column_spec(8, background = "lightyellow") %>%  
+  column_spec(9:10, background = "lightblue") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Coefficients
+
+```{r}
+tab_log_const <- results_boot_log_const$coefficients
+# names(tab) <- names(tab) %>%
+#   gsub("&#124;", "|", ., fixed = TRUE) %>%
+#   gsub("^Pr\\(>\\|z\\|\\)$", "Pr(>|z|)", .)
+
+results_asy_log_const$coefficients %>% 
+  cbind(., tab_log_const$RESI, tab_log_const$`2.5%`, tab_log_const$`97.5%`, tab_log_const$`Pr(>|z|)`) %>%
+  `colnames<-`(c(names(results_asy_log_const$coefficients), "RESI_Boot", "LCI_Boot", "UCI_Boot","p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "cccccccccc",  digits = 4) %>%
+  column_spec(4:5, background = "lightyellow") %>%  
+  column_spec(7:8, background = "lightblue") %>%  
+  column_spec(9, background = "lightyellow") %>%  
+  column_spec(10:11, background = "lightblue") %>%  
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Time
+
+```{r}
+cat("Time for asymptotic and bootstrap methods are: ", time_asy_log_const["elapsed"], "and",
+    time_boot_log_const["elapsed"], "seconds")
+```
+
+### Robust Covariance (HC0)
+
+```{r}
+time_asy_log_hc0 <- system.time({
+  results_asy_log_hc0 <- resiPEse(model_log, type = "HC0")
+})
+
+# resi_megan <- resi_pe(model_log, vcov.type = list(type = "HC0"), unbiased = TRUE)
+
+time_boot_log_hc0 <- system.time({
+  results_boot_log_hc0 <- resi(model_log, vcov.args = list(type = "HC0"), data = y1_data, unbiased = TRUE)
+})
+```
+
+#### ANOVA
+
+```{r}
+results_asy_log_hc0$anova %>% 
+  cbind(., results_boot_log_hc0$anova$RESI, results_boot_log_hc0$anova$`2.5%`, 
+        results_boot_log_hc0$anova$`97.5%`, results_boot_log_hc0$anova$`Pr(>Chisq)`) %>%
+  as.data.frame() %>%
+  `colnames<-`(c(names(results_asy_log_hc0$anova), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "ccccccccc",  digits = 4) %>%
+  column_spec(3:4, background = "lightyellow") %>%  
+  column_spec(6:7, background = "lightblue") %>%  
+  column_spec(8, background = "lightyellow") %>%  
+  column_spec(9:10, background = "lightblue") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Coefficients
+
+```{r}
+tab_log_hc0 <- results_boot_log_hc0$coefficients
+
+results_asy_log_hc0$coefficients %>% 
+  cbind(., tab_log_hc0$RESI, tab_log_hc0$`2.5%`, tab_log_hc0$`97.5%`, tab_log_hc0$`Pr(>|z|)`) %>%
+  `colnames<-`(c(names(results_asy_log_hc0$coefficients), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "cccccccccc",  digits = 4) %>%
+  column_spec(4:5, background = "lightyellow") %>%  
+  column_spec(7:8, background = "lightblue") %>%  
+  column_spec(9, background = "lightyellow") %>%  
+  column_spec(10:11, background = "lightblue") %>%  
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Time
+
+```{r}
+cat("Time for asymptotic and bootstrap methods are: ", time_asy_log_hc0["elapsed"], "and",
+    time_boot_log_hc0["elapsed"], "seconds")
+```
+
+## Linear model (Two-way interaction) {.tabset}
+
+Model: **cdi \~ diagnosis \* ns(age,3) + sex**
+
+### Parametric Covariance
+
+```{r}
+model_lm <- lm(cdi_total_tscore ~ diagnosis * ns(age,3) + sex, data = y1_data)
+
+em_grid <- emmeans(
+  model_lm,
+  ~ sex + diagnosis | age,
+  at = list(age = seq(min(y1_data$age),
+                                    max(y1_data$age),
+                                    length.out = 200))
+)
+
+plot_df <- as.data.frame(em_grid)
+plot_df$diagnosis <- factor(plot_df$diagnosis,
+                            levels = c(0, 1),
+                            labels = c("TD", "ASD"))
+ggplot(plot_df, aes(x = age,
+                    y = emmean,
+                    color = diagnosis)) +
+  geom_line(size = 1.2) +
+  facet_grid(~ sex) + 
+  geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL, fill = diagnosis),
+              alpha = 0.2, color = NA) +
+  labs(x = "Age (years)", y = "Predicted CDI Total T-scores",
+       color = "Diagnosis", fill = "Diagnosis",
+       title = "Predicted CDI Total T-scores by Sex and Diagnosis") +
+  theme_bw()
+ggsave(filename = "CDI/dx_cdiscore.png", width = 8, height = 4, dpi = 600)
+
+time_asy_lm_const <- system.time({
+  results_asy_lm_const <- resiPEse(model_lm, type = "const")
+})
+
+# resi_megan <- resi_pe(model_lm, vcov.type = list(type = "const"), unbiased = FALSE)
+
+time_boot_lm_const <- system.time({
+  results_boot_lm_const <- resi(model_lm, vcov.args = list(type = "const"), 
+                       data = y1_data, unbiased = TRUE)
+})
+```
+
+#### ANOVA
+
+```{r}
+results_asy_lm_const$anova %>% 
+  cbind(., results_boot_lm_const$anova$RESI, results_boot_lm_const$anova$`2.5%`, 
+        results_boot_lm_const$anova$`97.5%`, results_boot_lm_const$anova$`Pr(>F)`) %>%
+  as.data.frame() %>%
+  `colnames<-`(c(names(results_asy_lm_const$anova), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "ccccccccc",  digits = 4) %>%
+  column_spec(3:4, background = "lightyellow") %>%  
+  column_spec(6:7, background = "lightblue") %>%  
+  column_spec(8, background = "lightyellow") %>%  
+  column_spec(9:10, background = "lightblue") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Coefficients
+
+```{r}
+tab_lm_const <- results_boot_lm_const$coefficients
+
+results_asy_lm_const$coefficients %>% 
+  cbind(., tab_lm_const$RESI, tab_lm_const$`2.5%`, tab_lm_const$`97.5%`, tab_lm_const$`Pr(>|t|)`) %>%
+  `colnames<-`(c(names(results_asy_lm_const$coefficients), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "cccccccccc",  digits = 4) %>%
+  column_spec(4:5, background = "lightyellow") %>%  
+  column_spec(7:8, background = "lightblue") %>%  
+  column_spec(9, background = "lightyellow") %>%  
+  column_spec(10:11, background = "lightblue") %>%  
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Time
+
+```{r}
+cat("Time for asymptotic and bootstrap methods are: ", time_asy_lm_const["elapsed"], "and",
+    time_boot_lm_const["elapsed"], "seconds")
+```
+
+### Robust Covariance (HC3)
+
+```{r}
+time_asy_lm_hc3 <- system.time({
+  results_asy_lm_hc3 <- resiPEse(model_lm, type = "HC3")
+})
+
+time_boot_lm_hc3 <- system.time({
+  results_boot_lm_hc3 <- resi(model_lm, vcov.args = list(type = "HC3"), 
+                       data = y1_data, unbiased = TRUE)
+})
+```
+
+#### ANOVA
+
+```{r}
+results_asy_lm_hc3$anova %>% 
+  cbind(., results_boot_lm_hc3$anova$RESI, results_boot_lm_hc3$anova$`2.5%`, 
+        results_boot_lm_hc3$anova$`97.5%`, results_boot_lm_hc3$anova$`Pr(>F)`) %>%
+  as.data.frame() %>%
+  `colnames<-`(c(names(results_asy_lm_hc3$anova), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "ccccccccc",  digits = 4) %>%
+  column_spec(3:4, background = "lightyellow") %>%  
+  column_spec(6:7, background = "lightblue") %>%  
+  column_spec(8, background = "lightyellow") %>%  
+  column_spec(9:10, background = "lightblue") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Coefficients
+
+```{r}
+tab_lm_hc3 <- results_boot_lm_hc3$coefficients
+
+results_asy_lm_hc3$coefficients %>% 
+  cbind(., tab_lm_hc3$RESI, tab_lm_hc3$`2.5%`, tab_lm_hc3$`97.5%`, tab_lm_hc3$`Pr(>|t|)`) %>%
+  `colnames<-`(c(names(results_asy_lm_hc3$coefficients), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "cccccccccc",  digits = 4) %>%
+  column_spec(4:5, background = "lightyellow") %>%  
+  column_spec(7:8, background = "lightblue") %>%  
+  column_spec(9, background = "lightyellow") %>%  
+  column_spec(10:11, background = "lightblue") %>%  
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Time
+
+```{r}
+cat("Time for asymptotic and bootstrap methods are: ", time_asy_lm_hc3["elapsed"], "and",
+    time_boot_lm_hc3["elapsed"], "seconds")
+```
+
+## Linear model (Three-way interaction) {.tabset}
+
+Model: **cdi \~ diagnosis \* ns(age,3) + sex**
+
+### Parametric Covariance
+
+```{r}
+model_lm <- lm(cdi_total_tscore ~ diagnosis * ns(age,3) * sex, data = y1_data)
+
+em_grid <- emmeans(
+  model_lm,
+  ~ sex + diagnosis | age,
+  at = list(age = seq(min(y1_data$age),
+                                    max(y1_data$age),
+                                    length.out = 200))
+)
+
+plot_df <- as.data.frame(em_grid)
+
+ggplot(plot_df, aes(x = age,
+                    y = emmean,
+                    color = diagnosis)) +
+  geom_line(size = 1.2) +
+  facet_grid(~ sex) + 
+  geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL, fill = diagnosis),
+              alpha = 0.2, color = NA) +
+  labs(x = "Age (years)", y = "Predicted Total Problems T-score",
+       color = "Diagnosis", fill = "Diagnosis",
+       title = "Predicted Total Problems T-scores by Diagnosis") +
+  theme_bw()
+
+time_asy <- system.time({
+  results_asy <- resiPEse(model_lm, type = "const")
+})
+
+# resi_megan <- resi_pe(model_lm, vcov.type = list(type = "const"), unbiased = FALSE)
+
+time_boot <- system.time({
+  results_boot <- resi(model_lm, vcov.args = list(type = "const"), 
+                       data = y1_data, unbiased = TRUE)
+})
+```
+
+#### ANOVA
+
+```{r}
+results_asy$anova %>% 
+  cbind(., results_boot$anova$RESI, results_boot$anova$`2.5%`, results_boot$anova$`97.5%`, results_boot$anova$`Pr(>F)`) %>%
+  as.data.frame() %>%
+  `colnames<-`(c(names(results_asy$anova), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "ccccccccc",  digits = 4) %>%
+  column_spec(3:4, background = "lightyellow") %>%  
+  column_spec(6:7, background = "lightblue") %>%  
+  column_spec(8, background = "lightyellow") %>%  
+  column_spec(9:10, background = "lightblue") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Coefficients
+
+```{r}
+tab <- results_boot$coefficients
+
+results_asy$coefficients %>% 
+  cbind(., tab$RESI, tab$`2.5%`, tab$`97.5%`, tab$`Pr(>|t|)`) %>%
+  `colnames<-`(c(names(results_asy$coefficients), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "cccccccccc",  digits = 4) %>%
+  column_spec(4:5, background = "lightyellow") %>%  
+  column_spec(7:8, background = "lightblue") %>%  
+  column_spec(9, background = "lightyellow") %>%  
+  column_spec(10:11, background = "lightblue") %>%  
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Time
+
+```{r}
+cat("Time for asymptotic and bootstrap methods are: ", time_asy["elapsed"], "and", time_boot["elapsed"], "seconds")
+```
+
+
+
+### Robust Covariance (HC3)
+
+```{r}
+time_asy <- system.time({
+  results_asy <- resiPEse(model_lm, type = "HC3")
+})
+
+time_boot <- system.time({
+  results_boot <- resi(model_lm, vcov.args = list(type = "HC3"), 
+                       data = y1_data, unbiased = TRUE)
+})
+```
+
+#### ANOVA
+
+```{r}
+results_asy$anova %>% 
+  cbind(., results_boot$anova$RESI, results_boot$anova$`2.5%`, results_boot$anova$`97.5%`, results_boot$anova$`Pr(>F)`) %>%
+  as.data.frame() %>%
+  `colnames<-`(c(names(results_asy$anova), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "ccccccccc",  digits = 4) %>%
+  column_spec(3:4, background = "lightyellow") %>%  
+  column_spec(6:7, background = "lightblue") %>%  
+  column_spec(8, background = "lightyellow") %>%  
+  column_spec(9:10, background = "lightblue") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Coefficients
+
+```{r}
+tab <- results_boot$coefficients
+
+results_asy$coefficients %>% 
+  cbind(., tab$RESI, tab$`2.5%`, tab$`97.5%`, tab$`Pr(>|t|)`) %>%
+  `colnames<-`(c(names(results_asy$coefficients), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "cccccccccc",  digits = 4) %>%
+  column_spec(4:5, background = "lightyellow") %>%  
+  column_spec(7:8, background = "lightblue") %>%  
+  column_spec(9, background = "lightyellow") %>%  
+  column_spec(10:11, background = "lightblue") %>%  
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+#### Time
+
+```{r}
+cat("Time for asymptotic and bootstrap methods are: ", time_asy["elapsed"], "and", time_boot["elapsed"], "seconds")
+```
+
+
+## Longitudinal model
+
+```{r}
+long_data$record_id <- as.factor(long_data$record_id)
+long_data$sex <- as.factor(long_data$sex)
+long_data <- long_data[complete.cases(long_data), ]
+
+model_longi <- geeglm(cdi_total_tscore ~ diagnosis * ns(baseline_age,3) + sex, data = long_data, id = record_id)
+
+# anova(model_longi)
+
+time_asy <- system.time({
+  results_asy <- resiPEse(model_longi)
+})
+
+# results_pe <- resi_pe(model_longi, unbiased = TRUE)
+
+time_boot <- system.time({
+  results_boot <- resi(model_longi, data = long_data, unbiased = TRUE)
+})
+```
+
+
+### ANOVA
+
+```{r}
+results_asy$anova %>% 
+  cbind(., results_boot$anova$`CS-RESI`,  results_boot$anova$`P(>|Chi|)`,
+        results_boot$anova$`L 2.5%`, results_boot$anova$`L 97.5%`,
+        results_boot$anova$`CS 2.5%`, results_boot$anova$`CS 97.5%`) %>%
+  `colnames<-`(c(names(results_asy$anova), "CS-RESI", "p-value",
+                 "L-LCI", "L-UCI", "CS-LCI", "CS-UCI")) %>%
+  select(c("Df", "RESI_Xinyu", "RESI_Megan", "CS-RESI","RESI.SE", "LCI", 
+           "UCI", "L-LCI", "L-UCI", "CS-LCI", "CS-UCI", "p-value")) %>% 
+  `colnames<-`(c("Df", "RESI_Xinyu", "L-RESI", "CS-RESI","RESI.SE", "LCI", 
+                 "UCI", "L-LCI", "L-UCI", "CS-LCI", "CS-UCI", "p-value")) %>%
+  as.data.frame() %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "ccccccc",  digits = 4) %>%
+  column_spec(3:5, background = "lightyellow") %>%  
+  column_spec(7:12, background = "lightblue") %>%  
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+### Coefficients
+
+```{r}
+tab <- results_boot$coefficients
+
+results_asy$coefficients %>% 
+  cbind(., tab$`CS-RESI`, tab$`L 2.5%`, tab$`L 97.5%`, tab$`CS 2.5%`, tab$`CS 97.5%`, tab$`Pr(>|z|)`) %>% 
+  `colnames<-`(c(names(results_asy$coefficients), "CS-RESI", "L-LCI", "L-UCI", "CS-LCI", "CS-UCI", "p-value")) %>%
+  select(c("Estimate", "Std.Error", "RESI_Xinyu", "RESI_Megan", "CS-RESI", "RESI.SE", "LCI", "UCI",  "L-LCI", "L-UCI", "CS-LCI", "CS-UCI", "p-value")) %>% 
+  `colnames<-`(c("Estimate", "Std.Error", "RESI_Xinyu", "L-RESI", "CS-RESI", "RESI.SE", "LCI", "UCI",  "L-LCI", "L-UCI", "CS-LCI", "CS-UCI", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "ccccccccc",  digits = 4) %>%
+  column_spec(4:6, background = "lightyellow") %>%  
+  column_spec(8:13, background = "lightblue") %>%  
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+# SPARK dataset
+
+## Table 1
+
+```{r}
+raw_data2 <- read_csv("SPARK/cbcl_6_18-2025-07-14.csv")
+
+data2 <- raw_data2 %>%
+  filter(asd == TRUE) %>%
+  mutate(
+    age_at_eval_months = as.numeric(age_at_eval_months),
+    age_at_eval_years  = as.numeric(age_at_eval_years),
+    total_problems_t_score_bin = as.factor(ifelse(total_problems_t_score >= 65, 1, 0))
+    ) 
+data2 <- data2[complete.cases(data2[, c("total_problems_t_score", "sex")]), ]
+
+table1( ~ age_at_eval_years + asd + internalizing_problems_t_score + externalizing_problems_t_score + total_problems_t_score | sex, data = data2, overall = F)
+```
+
+## Linear model
+
+```{r}
+model_spark <- lm(
+  total_problems_t_score ~ sex * ns(age_at_eval_years, 3),
+  data = data2
+)
+em_grid <- emmeans(
+  model_spark,
+  ~ sex | age_at_eval_years,
+  at = list(age_at_eval_years = seq(min(data2$age_at_eval_years),
+                                    max(data2$age_at_eval_years),
+                                    length.out = 200))
+)
+
+plot_df <- as.data.frame(em_grid)
+
+ggplot(plot_df, aes(x = age_at_eval_years,
+                    y = emmean,
+                    color = sex)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL, fill = sex),
+              alpha = 0.2, color = NA) +
+  labs(x = "Age (years)", y = "Predicted Total Problems T-score",
+       color = "Sex", fill = "Sex",
+       title = "Predicted Total Problems T-scores by Age and Sex") +
+  theme_bw()
+
+# ggsave(filename = "SPARK/sex_tscore.png", width = 6, height = 4, dpi = 600)
+
+time_asy2 <- system.time({
+  results_asy2 <- resiPEse(model_spark, type = "HC3")
+})
+
+time_boot2 <- system.time({
+  results_boot2 <- resi(model_spark, vcov.args = list(type = "HC3"),
+                        data = data2, unbiased = TRUE)
+})
+```
+
+
+### ANOVA
+
+```{r}
+results_asy2$anova %>% 
+  cbind(., results_boot2$anova$RESI, results_boot2$anova$`2.5%`, results_boot2$anova$`97.5%`, results_boot2$anova$`Pr(>F)`) %>%
+  as.data.frame() %>%
+  `colnames<-`(c(names(results_asy2$anova), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "ccccccccc",  digits = 4) %>%
+  column_spec(3:4, background = "lightyellow") %>%  
+  column_spec(6:7, background = "lightblue") %>%  
+  column_spec(8, background = "lightyellow") %>%  
+  column_spec(9:10, background = "lightblue") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+### Coefficients
+
+```{r}
+tab2 <- results_boot2$coefficients
+
+results_asy2$coefficients %>% 
+  cbind(., tab2$RESI, tab2$`2.5%`, tab2$`97.5%`, tab2$`Pr(>|t|)`) %>%
+  `colnames<-`(c(names(results_asy2$coefficients), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "cccccccccc",  digits = 4) %>%
+  column_spec(4:5, background = "lightyellow") %>%  
+  column_spec(7:8, background = "lightblue") %>%  
+  column_spec(9, background = "lightyellow") %>%  
+  column_spec(10:11, background = "lightblue") %>%  
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+### Time
+
+```{r}
+cat("Time for asymptotic and bootstrap methods are: ", time_asy2["elapsed"], "and", time_boot2["elapsed"], "seconds")
+```
+
+## Logistic model
+
+```{r}
+model_spark_glm <- glm(
+  total_problems_t_score_bin ~ sex * ns(age_at_eval_years, 3),
+  data = data2, , family = binomial
+)
+
+em_grid <- emmeans(
+  model_spark_glm,
+  ~ sex | age_at_eval_years,
+  at = list(age_at_eval_years = seq(min(data2$age_at_eval_years),
+                                    max(data2$age_at_eval_years),
+                                    length.out = 200))
+)
+
+plot_df <- as.data.frame(em_grid)
+
+ggplot(plot_df, aes(x = age_at_eval_years,
+                    y = emmean,
+                    color = sex)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = asymp.LCL, ymax = asymp.UCL, fill = sex),
+              alpha = 0.2, color = NA) +
+  labs(x = "Age (years)", y = "Predicted Total Problems T-score",
+       color = "Sex", fill = "Sex",
+       title = "Predicted Total Problems T-scores by Age and Sex") +
+  theme_bw()
+# ggsave(filename = "SPARK/sex_tscore_glm.png", width = 6, height = 4, dpi = 600)
+
+
+time_asy3 <- system.time({
+  results_asy3 <- resiPEse(model_spark_glm, type = "const")
+})
+
+time_boot3 <- system.time({
+  results_boot3 <- resi(model_spark_glm, vcovfunc = vcov, data = data2, 
+                       unbiased = TRUE)
+})
+```
+
+
+### ANOVA
+
+```{r}
+results_asy3$anova %>% 
+  cbind(., results_boot3$anova$RESI, results_boot3$anova$`2.5%`, results_boot3$anova$`97.5%`, results_boot3$anova$`Pr(>Chisq)`) %>%
+  as.data.frame() %>%
+  `colnames<-`(c(names(results_asy3$anova), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "ccccccccc",  digits = 4) %>%
+  column_spec(3:4, background = "lightyellow") %>%  
+  column_spec(6:7, background = "lightblue") %>%  
+  column_spec(8, background = "lightyellow") %>%  
+  column_spec(9:10, background = "lightblue") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+### Coefficients
+
+```{r}
+tab3 <- results_boot3$coefficients
+
+results_asy3$coefficients %>% 
+  cbind(., tab3$RESI, tab3$`2.5%`, tab3$`97.5%`, tab3$`Pr(>|z|)`) %>%
+  `colnames<-`(c(names(results_asy3$coefficients), "RESI_Boot", "LCI_Boot", "UCI_Boot", "p-value")) %>%
+  kable(caption = "Asymptotic", booktabs = TRUE, align = "cccccccccc",  digits = 4) %>%
+  column_spec(4:5, background = "lightyellow") %>%  
+  column_spec(7:8, background = "lightblue") %>%  
+  column_spec(9, background = "lightyellow") %>%  
+  column_spec(10:11, background = "lightblue") %>%  
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+### Time
+
+```{r}
+cat("Time for asymptotic and bootstrap methods are: ", time_asy3["elapsed"], "and", time_boot3["elapsed"], "seconds")
+```

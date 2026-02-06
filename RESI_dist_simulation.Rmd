@@ -1,0 +1,1039 @@
+---
+title: "Asymptotic confidence intervals for the robust effect size index"
+author: Xinyu Zhang
+format: 
+  pdf:
+    latex_engine: pdflatex
+    fontsize: 11pt
+bibliography: MyLibrary.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("/media/disk2/asymptotic_resi")
+
+library(locfit)
+library(rootSolve)
+library(parallel) 
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pbmcapply)
+library(matrixcalc)
+library(RESI)
+library(ggpubr)
+library(effectsize)
+library(RColorBrewer)
+library(stringr)
+
+source("functions.R")
+source("test/resiPEse_Th1.R") # total derivative, theta = (phi, alpha, beta)
+source("test/resiPEse_Th2.R") # partial derivative, theta = (phi, alpha, beta)
+```
+
+# Configuration
+
+```{r}
+simConfig <- list(
+  # scenario setting
+  nsub_linear = c(50, 100, 150, 200, 300, 400),
+  nsub_logistic = c(50, 75, 100, 200, 500, 750, 1000, 1500),
+  model_type = c("linear", "logistic"),
+  
+  # linear model
+  pi_linear = 0.4,
+  cohen_ratio = (1/0.4 + 1/0.6)^(-1/2),
+  pi_logistic = 0.5,
+  ngroup = 2,
+  sigma = sqrt(2),
+  error = c("normal", "gamma", "hetero"),
+  
+  # logistic model
+  design = c("balanced", "semi-balanced", "unbalanced"),
+
+  # simulation setting
+  nsim = 1000,
+  mc.cores = 40
+)
+
+# path = "/media/disk2/asymptotic_resi/simulation/simresult1" # sum of the lower triangluar
+# path = "/media/disk2/asymptotic_resi/simulation/simresult2" # sum of the whole matrix for se, partial derivative
+# path = "/media/disk2/asymptotic_resi/simulation/simresult3" # total derivative with phi in theta 
+# path = "/media/disk2/asymptotic_resi/simulation/simresult4" # partial derivative with phi in theta
+# path = "/media/disk2/asymptotic_resi/simulation/simresult5" # successful simulations
+path = "/media/disk2/asymptotic_resi/simulation/simresult_paper" # final version for paper
+
+results_linear <- expand.grid(
+  model_type = "linear",
+  error = simConfig$error,
+  S = seq(0, 1, length.out = 5),
+  nsub = simConfig$nsub_linear,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(resultfile = file.path(path, model_type, error, paste0("S", S, "/nsub", nsub)))
+
+results_logistic <- expand.grid(
+  model_type = "logistic",
+  error = as.character(simConfig$design),
+  S = seq(0, 0.4, length.out = 5),
+  nsub = simConfig$nsub_logistic,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(resultfile = file.path(path, model_type, error,
+                                paste0("S", S, "/nsub", nsub)))
+
+results_all <- bind_rows(results_linear, results_logistic) %>% 
+  arrange(model_type, error, S, nsub)
+
+simtime_table <- bind_rows(results_linear, results_logistic) %>%
+  mutate(time = NA) %>%
+  dplyr::select(-resultfile)
+
+# results_all
+# simtime_table
+```
+
+# Simulation 
+
+For linear model, normal error $\epsilon \sim N(0,\sigma^2)$, gamma error $\epsilon \sim Gamma(\alpha, \frac{\sqrt{\alpha}}{\sigma})-\sqrt{\alpha}\sigma$. For heteroskedasticity error: $\epsilon \mid X=0 \sim N(0,\sigma_0^2), \quad \epsilon \mid X = 1 \sim N(0, \sigma_1^2)$, given that $p = P(X=1)$ and $r = \frac{\sigma_1^2}{\sigma_0^2}$, $Var(\epsilon) = (1-p)\sigma_0^2 + p\sigma_1^2 =\sigma^2$. We have $\sigma_0^2 = \frac{\sigma^2}{(1-p) + pr}$, $\sigma_1^2 = 2\sigma_0^2$. $Var(\hat\beta) = \frac{\sigma_1^2}{p} + \frac{\sigma_0^2}{1-p}$, so we can compute true $\beta$.
+
+
+```{r, eval=TRUE}
+# sce_results <- results_all
+sce_results <- results_all %>% filter(model_type == "logistic")
+# sce_results <- results_all %>% filter(model_type == "linear")
+simtime <- simtime_table %>% filter(model_type == "logistic")
+
+for(sce in 1:nrow(sce_results)){
+  
+  set.seed(1000 + sce)
+  
+  # ========== Setting ========== 
+  
+  model_type = sce_results$model_type[sce]
+  error = sce_results$error[sce]
+  S = sce_results$S[sce]
+  nsub = sce_results$nsub[sce]
+  resultfile = sce_results$resultfile[sce]
+  nsim = simConfig$nsim
+  # nsim = 500
+
+  # Track progress 
+  print(resultfile) 
+  dir.create(resultfile, showWarnings = FALSE, recursive = TRUE)
+  
+  # ========== Simulation ==========
+  
+  if (file.exists(file.path(resultfile, "result_dat.rds"))) {
+    result_dat = readRDS(file.path(resultfile, "result_dat.rds"))
+  }else{
+    
+  start = Sys.time()
+  
+  allsimresults = pbmclapply(1:nsim, function(sim){
+    
+    ## ========== Linear model ==========
+    
+    if(model_type == "linear"){
+      
+      p = simConfig$pi_linear
+      sigma = simConfig$sigma
+      dx = as.numeric(rbinom(nsub, 1, prob = p))
+        
+       # Generate error term
+      if(error == "normal"){ # homoskedasticity
+        beta_true = S * sigma / sqrt(p * (1 - p))
+        error_term = rnorm(nsub, mean = 0, sd = sigma)
+        
+      }else if(error == "gamma"){  # homoskedasticity
+        beta_true = S * sigma / sqrt(p * (1 - p))
+        shape = 1.2
+        error_term = rgamma(nsub, shape, rate = sqrt(shape)/sigma) - 
+          sqrt(shape) * sigma
+        
+      }else if(error == "hetero"){ # heteroskedasticity
+        r = 3
+        sigma0_sq = sigma^2 / ((1 - p) + p * r)
+        sigma1_sq = r * sigma0_sq
+        beta_true = S * sqrt((sigma0_sq/(1-p) + sigma1_sq/p))
+        error_term = rnorm(nsub, mean = 0, 
+                           sd = ifelse(dx == 0, sqrt(sigma0_sq), sqrt(sigma1_sq)))
+      }else{
+        stop("Unsupported error type")
+      }
+    
+      Y = 1 + beta_true * dx + error_term
+      model = lm(Y ~ dx)
+      
+    ## ========== Logistic model ==========
+      
+    }else if(model_type == "logistic"){
+      
+      p = simConfig$pi_logistic
+      dx = as.numeric(rbinom(nsub, 1, prob = p))
+      
+      # select the first root as true beta
+      a = case_when(
+        error == "balanced" ~ 0,
+        error == "semi-balanced" ~ -1,
+        error == "unbalanced" ~ -2)
+      
+      if(S == 0){
+        beta_true = 0
+      }else{
+        beta_true = uniroot.all(function(beta) 
+          S_squared(beta, alpha = a, px = p) - S^2, lower = 0, upper = 10)[1]
+      }
+      
+      # logit link
+      lin_pred = rowSums(model.matrix(~ dx)[, -1, drop = FALSE] * beta_true + a) 
+      Y = rbinom(nsub, 1, prob = expit(lin_pred))
+      model = glm(Y ~ dx, family = binomial)
+    }
+    
+    # Models
+    if(model_type == "linear"){
+      # Cohen's d and Conhen's f
+      d_res <- cohens_d(Y ~ dx, data = data.frame(Y = Y, dx = dx))
+      f_res <- cohens_f(anova(model), alternative = "two.sided")
+      # RESI
+      ## Signed
+      th1_const_signed <- resiPEse_Th1(model, variable = "dx", type = "const", unsigned = FALSE)
+      th1_hc_signed <- resiPEse_Th1(model, variable = "dx", type = "HC3", unsigned = FALSE)
+      th2_const_signed <- resiPEse_Th2(model, variable = "dx", type = "const", unsigned = FALSE)
+      th2_hc_signed <- resiPEse_Th2(model, variable = "dx", type = "HC3", unsigned = FALSE)
+      
+      ## Unsigned
+      th1_const_unsigned <- resiPEse_Th1(model, variable = "dx", type = "const", unsigned = TRUE)
+      th1_hc_unsigned <- resiPEse_Th1(model, variable = "dx", type = "HC3", unsigned = TRUE)
+      th2_const_unsigned <- resiPEse_Th2(model, variable = "dx", type = "const", unsigned = TRUE)
+      th2_hc_unsigned <- resiPEse_Th2(model, variable = "dx", type = "HC3", unsigned = TRUE)
+      
+      
+    }else{
+      # No Cohen's d and Conhen's f
+      d_res = data.frame(Cohens_d = NA, CI_low = NA, CI_high = NA)
+      f_res = data.frame(Cohens_f = NA, CI_low = NA, CI_high = NA)
+      # RESI
+      ## Signed
+      th1_const_signed <- resiPEse_Th1(model, variable = "dx", 
+                                       type = "const", unsigned = FALSE)
+      th1_hc_signed <- resiPEse_Th1(model, variable = "dx", 
+                                    type = "HC0", unsigned = FALSE)
+      th2_const_signed <- resiPEse_Th2(model, variable = "dx", 
+                                       type = "const", unsigned = FALSE)
+      th2_hc_signed <- resiPEse_Th2(model, variable = "dx", 
+                                    type = "HC0", unsigned = FALSE)
+      
+      ## Unsigned
+      th1_const_unsigned <- resiPEse_Th1(model, variable = "dx", 
+                                         type = "const", unsigned = TRUE)
+      th1_hc_unsigned <- resiPEse_Th1(model, variable = "dx", 
+                                      type = "HC0", unsigned = TRUE)
+      th2_const_unsigned <- resiPEse_Th2(model, variable = "dx", 
+                                         type = "const", unsigned = TRUE)
+      th2_hc_unsigned <- resiPEse_Th2(model, variable = "dx", 
+                                      type = "HC0", unsigned = TRUE)
+      
+    }
+    
+    data.frame(
+      # Effect size
+      ## Signed
+      RESI1_const_signed = th1_const_signed$RESI_Xinyu, 
+      RESI1_hc_signed = th1_hc_signed$RESI_Xinyu, 
+      RESI2_const_signed = th2_const_signed$RESI_Xinyu, 
+      RESI2_hc_signed = th2_hc_signed$RESI_Xinyu, 
+      
+      ## Unsigned
+      RESI1_const_unsigned = th1_const_unsigned$RESI_Xinyu, 
+      RESI1_hc_unsigned = th1_hc_unsigned$RESI_Xinyu, 
+      RESI2_const_unsigned = th2_const_unsigned$RESI_Xinyu, 
+      RESI2_hc_unsigned = th2_hc_unsigned$RESI_Xinyu, 
+      
+      ## Other
+      Cohens_d = -d_res$Cohens_d, 
+      Cohens_f = f_res$Cohens_f, 
+      
+      # SE
+      ## Signed
+      SE1_const_signed = th1_const_signed$RESI.SE, 
+      SE1_hc_signed = th1_hc_signed$RESI.SE, 
+      SE2_const_signed = th2_const_signed$RESI.SE, 
+      SE2_hc_signed = th2_hc_signed$RESI.SE, 
+      
+      ## Unsigned
+      SE1_const_unsigned = th1_const_unsigned$RESI.SE, 
+      SE1_hc_unsigned = th1_hc_unsigned$RESI.SE, 
+      SE2_const_unsigned = th2_const_unsigned$RESI.SE, 
+      SE2_hc_unsigned = th2_hc_unsigned$RESI.SE, 
+      
+      # Coverage
+      ## Signed
+      LCI1_const_signed = th1_const_signed$LCI, 
+      UCI1_const_signed = th1_const_signed$UCI, 
+      LCI1_hc_signed = th1_hc_signed$LCI, 
+      UCI1_hc_signed = th1_hc_signed$UCI, 
+      LCI2_const_signed = th2_const_signed$LCI, 
+      UCI2_const_signed = th2_const_signed$UCI, 
+      LCI2_hc_signed = th2_hc_signed$LCI, 
+      UCI2_hc_signed = th2_hc_signed$UCI, 
+      
+      ## Unsigned
+      LCI1_const_unsigned = th1_const_unsigned$LCI, 
+      UCI1_const_unsigned = th1_const_unsigned$UCI, 
+      LCI1_hc_unsigned = th1_hc_unsigned$LCI, 
+      UCI1_hc_unsigned = th1_hc_unsigned$UCI, 
+      LCI2_const_unsigned = th2_const_unsigned$LCI, 
+      UCI2_const_unsigned = th2_const_unsigned$UCI, 
+      LCI2_hc_unsigned = th2_hc_unsigned$LCI, 
+      UCI2_hc_unsigned = th2_hc_unsigned$UCI, 
+      
+      ## Other
+      LCI_Cohens_d = -d_res$CI_high, 
+      UCI_Cohens_d = -d_res$CI_low,
+      LCI_Cohens_f = f_res$CI_low, 
+      UCI_Cohens_f = f_res$CI_high)
+    
+  }, mc.cores = simConfig$mc.cores,  mc.set.seed = TRUE)
+  
+  simtime$time[sce] = Sys.time() - start
+  
+  # ========== Organization ==========
+  
+  result_dat = do.call(rbind, allsimresults)
+  saveRDS(result_dat, file = file.path(resultfile, "result_dat.rds"))
+  }
+  
+  # Effect Size
+  ## Signed
+  sce_results[sce, "Mean_RESI1_const_signed"] = mean(result_dat$RESI1_const_signed, na.rm = T)
+  sce_results[sce, "Mean_RESI1_hc_signed"] = mean(result_dat$RESI1_hc_signed, na.rm = T)
+  sce_results[sce, "Mean_RESI2_const_signed"] = mean(result_dat$RESI2_const_signed, na.rm = T)
+  sce_results[sce, "Mean_RESI2_hc_signed"] = mean(result_dat$RESI2_hc_signed, na.rm = T)
+  
+  ## Unsigned
+  sce_results[sce, "Mean_RESI1_const_unsigned"] = mean(result_dat$RESI1_const_unsigned, na.rm = T)
+  sce_results[sce, "Mean_RESI1_hc_unsigned"] = mean(result_dat$RESI1_hc_unsigned, na.rm = T)
+  sce_results[sce, "Mean_RESI2_const_unsigned"] = mean(result_dat$RESI2_const_unsigned, na.rm = T)
+  sce_results[sce, "Mean_RESI2_hc_unsigned"] = mean(result_dat$RESI2_hc_unsigned, na.rm = T)
+  
+  # sce_results[sce, "Mean_RESI_Megan_const"] = mean(result_dat$RESI_Megan_const, na.rm = T)
+  # sce_results[sce, "Mean_RESI_Megan_hc"] = mean(result_dat$RESI_Megan_hc, na.rm = T)
+  sce_results[sce, "Mean_Cohens_d"] = mean(result_dat$Cohens_d, na.rm = T)
+  sce_results[sce, "Mean_Cohens_f"] = mean(result_dat$Cohens_f, na.rm = T)
+  
+  
+  # Variance
+  ## Signed
+  sce_results[sce, "Emp_Var1_const_signed"] = var(result_dat$RESI1_const_signed, na.rm = TRUE)
+  sce_results[sce, "Emp_Var1_hc_signed"]    = var(result_dat$RESI1_hc_signed, na.rm = TRUE)
+  sce_results[sce, "Emp_Var2_const_signed"] = var(result_dat$RESI2_const_signed, na.rm = TRUE)
+  sce_results[sce, "Emp_Var2_hc_signed"]    = var(result_dat$RESI2_hc_signed, na.rm = TRUE)
+
+  ## Unsigned
+  sce_results[sce, "Emp_Var1_const_unsigned"] = var(result_dat$RESI1_const_unsigned, na.rm = TRUE)
+  sce_results[sce, "Emp_Var1_hc_unsigned"]    = var(result_dat$RESI1_hc_unsigned, na.rm = TRUE)
+  sce_results[sce, "Emp_Var2_const_unsigned"] = var(result_dat$RESI2_const_unsigned, na.rm = TRUE)
+  sce_results[sce, "Emp_Var2_hc_unsigned"]    = var(result_dat$RESI2_hc_unsigned, na.rm = TRUE)
+
+  ## Signed
+  sce_results[sce, "MeanAnalytic_Var1_const_signed"] = mean(result_dat$SE1_const_signed^2, na.rm = TRUE)
+  sce_results[sce, "MeanAnalytic_Var1_hc_signed"]    = mean(result_dat$SE1_hc_signed^2, na.rm = TRUE)
+  sce_results[sce, "MeanAnalytic_Var2_const_signed"] = mean(result_dat$SE2_const_signed^2, na.rm = TRUE)
+  sce_results[sce, "MeanAnalytic_Var2_hc_signed"]    = mean(result_dat$SE2_hc_signed^2, na.rm = TRUE)
+
+  ## Unsigned
+  sce_results[sce, "MeanAnalytic_Var1_const_unsigned"] = mean(result_dat$SE1_const_unsigned^2, na.rm = TRUE)
+  sce_results[sce, "MeanAnalytic_Var1_hc_unsigned"]    = mean(result_dat$SE1_hc_unsigned^2, na.rm = TRUE)
+  sce_results[sce, "MeanAnalytic_Var2_const_unsigned"] = mean(result_dat$SE2_const_unsigned^2, na.rm = TRUE)
+  sce_results[sce, "MeanAnalytic_Var2_hc_unsigned"]    = mean(result_dat$SE2_hc_unsigned^2, na.rm = TRUE)
+
+
+
+  # Coverage
+  ## Signed
+  sce_results[sce, "Lcoverage1_const_signed"] = mean(result_dat$LCI1_const_signed <= S, na.rm = TRUE)
+  sce_results[sce, "Ucoverage1_const_signed"] = mean(result_dat$UCI1_const_signed >= S, na.rm = TRUE)
+  sce_results[sce, "Coverage1_const_signed"]  = mean(result_dat$LCI1_const_signed <= S & 
+                                                       result_dat$UCI1_const_signed >= S, na.rm = TRUE)
+  
+  sce_results[sce, "Lcoverage1_hc_signed"] = mean(result_dat$LCI1_hc_signed <= S, na.rm = TRUE)
+  sce_results[sce, "Ucoverage1_hc_signed"] = mean(result_dat$UCI1_hc_signed >= S, na.rm = TRUE)
+  sce_results[sce, "Coverage1_hc_signed"]  = mean(result_dat$LCI1_hc_signed <= S & 
+                                                    result_dat$UCI1_hc_signed >= S, na.rm = TRUE)
+  
+  sce_results[sce, "Lcoverage2_const_signed"] = mean(result_dat$LCI2_const_signed <= S, na.rm = TRUE)
+  sce_results[sce, "Ucoverage2_const_signed"] = mean(result_dat$UCI2_const_signed >= S, na.rm = TRUE)
+  sce_results[sce, "Coverage2_const_signed"]  = mean(result_dat$LCI2_const_signed <= S & 
+                                                       result_dat$UCI2_const_signed >= S, na.rm = TRUE)
+  
+  sce_results[sce, "Lcoverage2_hc_signed"] = mean(result_dat$LCI2_hc_signed <= S, na.rm = TRUE)
+  sce_results[sce, "Ucoverage2_hc_signed"] = mean(result_dat$UCI2_hc_signed >= S, na.rm = TRUE)
+  sce_results[sce, "Coverage2_hc_signed"]  = mean(result_dat$LCI2_hc_signed <= S & 
+                                                    result_dat$UCI2_hc_signed >= S, na.rm = TRUE)
+  
+  # Unsigned
+  sce_results[sce, "Lcoverage1_const_unsigned"] = mean(result_dat$LCI1_const_unsigned <= S, na.rm = TRUE)
+  sce_results[sce, "Ucoverage1_const_unsigned"] = mean(result_dat$UCI1_const_unsigned >= S, na.rm = TRUE)
+  sce_results[sce, "Coverage1_const_unsigned"]  = mean(result_dat$LCI1_const_unsigned <= S & 
+                                                         result_dat$UCI1_const_unsigned >= S, na.rm = TRUE)
+  
+  sce_results[sce, "Lcoverage1_hc_unsigned"] = mean(result_dat$LCI1_hc_unsigned <= S, na.rm = TRUE)
+  sce_results[sce, "Ucoverage1_hc_unsigned"] = mean(result_dat$UCI1_hc_unsigned >= S, na.rm = TRUE)
+  sce_results[sce, "Coverage1_hc_unsigned"]  = mean(result_dat$LCI1_hc_unsigned <= S & 
+                                                      result_dat$UCI1_hc_unsigned >= S, na.rm = TRUE)
+  
+  sce_results[sce, "Lcoverage2_const_unsigned"] = mean(result_dat$LCI2_const_unsigned <= S, na.rm = TRUE)
+  sce_results[sce, "Ucoverage2_const_unsigned"] = mean(result_dat$UCI2_const_unsigned >= S, na.rm = TRUE)
+  sce_results[sce, "Coverage2_const_unsigned"]  = mean(result_dat$LCI2_const_unsigned <= S & 
+                                                         result_dat$UCI2_const_unsigned >= S, na.rm = TRUE)
+  
+  sce_results[sce, "Lcoverage2_hc_unsigned"] = mean(result_dat$LCI2_hc_unsigned <= S, na.rm = TRUE)
+  sce_results[sce, "Ucoverage2_hc_unsigned"] = mean(result_dat$UCI2_hc_unsigned >= S, na.rm = TRUE)
+  sce_results[sce, "Coverage2_hc_unsigned"]  = mean(result_dat$LCI2_hc_unsigned <= S & 
+                                                      result_dat$UCI2_hc_unsigned >= S, na.rm = TRUE)
+  
+  ## Other
+  sce_results[sce, "Cohens_d_Coverage"] = mean(result_dat$LCI_Cohens_d <= S * 1/simConfig$cohen_ratio &
+                                                 result_dat$UCI_Cohens_d >= S * 1/simConfig$cohen_ratio, 
+                                               na.rm = T)
+  sce_results[sce, "Cohens_f_Coverage"] = mean(result_dat$LCI_Cohens_f <= S &
+                                                 result_dat$UCI_Cohens_f >= S, na.rm = T)
+}
+
+# saveRDS(simtime, file.path(path, "linear/simtime.rds"))
+# saveRDS(sce_results, file.path(path, "linear/sce_results_quasi_04.rds"))
+# save.image(file = file.path(path, "linear/Allsces_quasi_04.RData"))
+
+saveRDS(simtime, file.path(path, "logistic/simtime.rds"))
+saveRDS(sce_results, file.path(path, "logistic/sce_results_05.rds"))
+save.image(file = file.path(path, "logistic/Allsces_05.RData"))
+
+# save.image(file = file.path(path, "Allsces.RData"))
+# saveRDS(sce_results, file.path(path, "sce_results.rds"))
+
+stop()
+```
+
+# Plot
+
+## Linear model
+
+```{r}
+sce_results <- readRDS("/media/disk2/asymptotic_resi/simulation/simresult_paper/linear/sce_results_quasi_04.rds")
+
+linear_results <- sce_results %>% filter(model_type == "linear") %>%
+  mutate(S_label = factor(S, labels = paste0("S = ", unique(S))),
+         error = factor(error, levels = c("normal", "gamma", "hetero"), 
+                        labels = c("Normal", "Gamma", "Hetero")))
+
+# Bias comparison
+linear_bias <- linear_results %>%
+  mutate(Cohen_f_Bias = Mean_Cohens_f - S,
+         Cohen_d_Bias = Mean_Cohens_d * simConfig$cohen_ratio - S,
+         # Package_Bias_const = Mean_RESI_Megan_const - S,
+         # Package_Bias_hc = Mean_RESI_Megan_hc - S,
+         RESI1_Bias_const_signed = Mean_RESI1_const_signed - S,
+         RESI1_Bias_hc_signed = Mean_RESI1_hc_signed - S,
+         RESI1_Bias_const_unsigned = Mean_RESI1_const_unsigned - S,
+         RESI1_Bias_hc_unsigned = Mean_RESI1_hc_unsigned - S,
+         
+         RESI2_Bias_const_signed = Mean_RESI2_const_signed - S,
+         RESI2_Bias_hc_signed = Mean_RESI2_hc_signed - S,
+         RESI2_Bias_const_unsigned = Mean_RESI2_const_unsigned - S,
+         RESI2_Bias_hc_unsigned = Mean_RESI2_hc_unsigned - S) 
+
+long_linear_bias <- pivot_longer(linear_bias, 
+                                 cols = contains("_Bias"), 
+                                 names_to = "method",
+                                 values_to = "bias") %>% 
+  mutate(
+    label = case_when(
+      str_detect(method, "const") ~ "const",
+      str_detect(method, "hc") ~ "hc",
+      TRUE ~ "other"  
+    ),
+    method_base = str_remove(method, "_(const|hc)$")) %>%
+  mutate(method = factor(method, levels = c("Cohen_f_Bias", "Cohen_d_Bias", 
+                                            "Package_Bias_const", "Package_Bias_hc", 
+                                            "RESI1_Bias_const_signed", "RESI1_Bias_hc_signed",
+                                            "RESI1_Bias_const_unsigned", "RESI1_Bias_hc_unsigned",
+                                            "RESI2_Bias_const_signed", "RESI2_Bias_hc_signed",
+                                            "RESI2_Bias_const_unsigned", "RESI2_Bias_hc_unsigned"))) %>%
+  select(model_type, error, S, nsub, S_label, method, bias, label) %>%
+  mutate(S_label = paste0("S[beta] == ", S))
+
+bias_label <- c(
+      "RESI1_Bias_const_signed" = "Signed RESI (Param)",
+      "RESI1_Bias_hc_signed"    = "Signed RESI (Robust)",
+      "RESI1_Bias_const_unsigned" = "Unsigned RESI (Param)",
+      "RESI1_Bias_hc_unsigned"    = "Unsigned RESI (Robust)",
+      
+      "RESI2_Bias_const_signed" = "Signed RESI2 (Param)",
+      "RESI2_Bias_hc_signed"    = "Signed RESI2 (Robust)",
+      "RESI2_Bias_const_unsigned" = "Unsigned RESI2 (Param)",
+      "RESI2_Bias_hc_unsigned"    = "Unsigned RESI2 (Robust)",
+      
+      "Cohen_d_Bias"        = "Cohen's d",
+      "Cohen_f_Bias"        = "Cohen's f"
+      # "Package_Bias_const"  = "Package (Param)",
+      # "Package_Bias_hc"     = "Package (HC3)"
+    )
+coverage_label <- c(
+  "Cohens_d_Coverage" = "Cohen's d",
+  "Cohens_f_Coverage" = "Cohen's f",
+  "Coverage1_const_signed" = "Signed RESI (Param)",
+  "Coverage1_hc_signed"    = "Signed RESI (Robust)",
+  "Coverage1_const_unsigned" = "Unsigned RESI (Param)",
+  "Coverage1_hc_unsigned"    = "Unsigned RESI (Robust)",
+  
+  "Coverage2_const_signed" = "Signed RESI (Param)",
+  "Coverage2_hc_signed"    = "Signed RESI (Robust)",
+  "Coverage2_const_unsigned" = "Unsigned RESI (Param)",
+  "Coverage2_hc_unsigned"    = "Unsigned RESI (Robust)"
+)
+
+bias_color <- c(
+  "RESI1_Bias_const_signed" = "#619CFF", 
+  "RESI1_Bias_hc_signed" = "#619CFF", 
+  "RESI1_Bias_const_unsigned" = "#619CFF", 
+  "RESI1_Bias_hc_unsigned" = "#619CFF", 
+  "RESI2_Bias_const_signed" = "#E69F00", 
+  "RESI2_Bias_hc_signed" = "#E69F00", 
+  "RESI2_Bias_const_unsigned" = "#E69F00", 
+  "RESI2_Bias_hc_unsigned" = "#E69F00", 
+  "Cohen_d_Bias"  = "#F8766D", 
+  "Cohen_f_Bias"  = "#F8766D"
+)
+
+coverage_color <- c(
+  "Coverage1_const_signed" = "#619CFF", 
+  "Coverage1_hc_signed" = "#619CFF", 
+  "Coverage1_const_unsigned" = "#619CFF", 
+  "Coverage1_hc_unsigned" = "#619CFF", 
+  "Coverage2_const_signed" = "#E69F00", 
+  "Coverage2_hc_signed" = "#E69F00",
+  "Coverage2_const_unsigned" = "#E69F00", 
+  "Coverage2_hc_unsigned" = "#E69F00",
+  "Cohens_d_Coverage" = "#F8766D",
+  "Cohens_f_Coverage" = "#F8766D"
+)
+
+bias_linetype <- c(
+  "Cohen_f_Bias"       = "solid",
+  "Cohen_d_Bias"       = "solid",
+  # "Package_Bias_const" = "dashed",
+  # "Package_Bias_hc"    = "solid",
+  "RESI1_Bias_const_signed"= "solid",
+  "RESI1_Bias_hc_signed"   = "dashed",
+  "RESI1_Bias_const_unsigned"= "solid",
+  "RESI1_Bias_hc_unsigned"   = "dashed",
+  "RESI2_Bias_const_signed" = "solid", 
+  "RESI2_Bias_hc_signed" = "dashed", 
+  "RESI2_Bias_const_unsigned" = "solid", 
+  "RESI2_Bias_hc_unsigned" = "dashed")
+
+
+coverage_linetype <- c(
+  "Coverage1_const_signed" = "solid", 
+  "Coverage1_hc_signed" = "dashed", 
+  "Coverage1_const_unsigned" = "solid", 
+  "Coverage1_hc_unsigned" = "dashed", 
+  "Coverage2_const_signed" = "solid", 
+  "Coverage2_hc_signed" = "dashed",
+  "Coverage2_const_unsigned" = "solid", 
+  "Coverage2_hc_unsigned" = "dashed",
+  "Cohens_d_Coverage" = "solid",
+  "Cohens_f_Coverage" = "solid"
+)
+
+
+# Coverage comparison
+long_linear_coverage <- pivot_longer(linear_results, 
+                                     cols = contains("Coverage", ignore.case = TRUE), 
+                                     names_to = "method",
+                                     values_to = "coverage") %>%
+  mutate(
+    label = case_when(
+      str_detect(method, "const") ~ "const",
+      str_detect(method, "hc") ~ "hc",
+      TRUE ~ "other"  
+    ),
+    method_base = str_remove(method, "_(const|hc)$")) %>%
+    select(model_type, error, S, nsub, S_label, method, coverage, label) %>%
+  mutate(S_label = paste0("S[beta] == ", S))
+
+# bias (unsigned RESI + Cohen's f)
+p1 <- ggplot(data = long_linear_bias %>% 
+               filter(method %in% c("Cohen_f_Bias", 
+                                    "RESI1_Bias_const_unsigned",
+                                    "RESI1_Bias_hc_unsigned"))) + 
+  geom_line(aes(x = nsub, y = bias, color = method, linetype = method)) + 
+  facet_grid(
+    error ~ S_label,
+      labeller = labeller(S_label = label_parsed, error = label_value)
+  ) + 
+  theme_bw() + 
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  labs(title = "Bias (Unsigned Effect Size)", 
+       x = "Number of subjects", y = "Bias", color = "Method", 
+       linetype = "Method") +
+  theme(legend.position = "top") +
+  scale_color_manual(values = bias_color, labels = bias_label) +
+  scale_linetype_manual(values = bias_linetype, labels = bias_label)
+
+# coverage (unsigned RESI + Cohen's f)
+p2 <- ggplot(data = long_linear_coverage %>% 
+               filter(method %in% c("Cohens_f_Coverage", 
+                                    "Coverage1_const_unsigned", "Coverage1_hc_unsigned"))) +
+  geom_line(aes(x = nsub, y = coverage, color = method, linetype = method)) + 
+  facet_grid(
+    error ~ S_label,
+      labeller = labeller(S_label = label_parsed, error = label_value)
+  ) +
+  theme_bw() + 
+  geom_hline(yintercept = 0.95, linetype = "dotted") +
+  labs(title = "Coverage (Unsigned Effect Size)", 
+       x = "Number of subjects", y = "Coverage", color = "Method", 
+       linetype = "Method") + 
+  theme(legend.position = "top")  +
+  scale_color_manual(values = coverage_color, labels = coverage_label) +
+  scale_linetype_manual(values = coverage_linetype, labels = coverage_label)
+
+# Bias (signed RESI + cohen's d)
+p3 <- ggplot(long_linear_bias %>% 
+               filter(method %in% c("Cohen_d_Bias", "RESI1_Bias_const_signed",
+                                    "RESI1_Bias_hc_signed"))) + 
+  geom_line(aes(x = nsub, y = bias, color = method, linetype = method)) + 
+  facet_grid(
+    error ~ S_label,
+      labeller = labeller(S_label = label_parsed, error = label_value)
+  ) + 
+  theme_bw() + 
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  labs(title = "Bias (Signed Effect Size)", 
+       x = "Number of subjects", y = "Bias", color = "Method", 
+       linetype = "Method") +
+  theme(legend.position = "top") +
+  scale_color_manual(values = bias_color,  labels = bias_label) +
+  scale_linetype_manual(values = bias_linetype,labels = bias_label)
+
+# coverage (signed RESI + cohen's d)
+p4 <- ggplot(data = long_linear_coverage %>% 
+               filter(method %in% c("Cohens_d_Coverage", 
+                                    "Coverage1_const_signed", "Coverage1_hc_signed"))) +
+  geom_line(aes(x = nsub, y = coverage, color = method, linetype = method)) + 
+  facet_grid(
+    error ~ S_label,
+      labeller = labeller(S_label = label_parsed, error = label_value)
+  ) + 
+  theme_bw() + 
+  geom_hline(yintercept = 0.95, linetype = "dotted") +
+  labs(title = "Coverage (Signed Effect Size)", 
+       x = "Number of subjects", y = "Coverage", color = "Method", 
+       linetype = "Method") + 
+  theme(legend.position = "top")  +
+  scale_color_manual(values = coverage_color, labels = coverage_label) +
+  scale_linetype_manual(values = coverage_linetype,labels = coverage_label)
+```
+
+
+```{r, fig.width=12, fig.height=5}
+ggarrange(p1, p2)
+# ggsave("/media/disk2/asymptotic_resi/simulation/simresult_paper/linear/unsigned.png", height = 5, width = 12, dpi = 600)
+ggarrange(p3, p4)
+# ggsave("/media/disk2/asymptotic_resi/simulation/simresult_paper/linear/signed.png", height = 5, width = 12, dpi = 600)
+```
+
+## Logistic model
+
+```{r}
+sce_results <- readRDS("/media/disk2/asymptotic_resi/simulation/simresult_paper/logistic/sce_results_05.rds")
+logistic_results <- sce_results %>% filter(model_type == "logistic")  %>% 
+  mutate(S_label = factor(S, labels = paste0("S = ", unique(S))),
+         error = factor(error, levels = c("balanced", "semi-balanced", "unbalanced"), 
+                        labels = c("Balanced", "Semi-balanced", "Unbalanced")))
+
+# Bias comparison
+logistic_bias <- logistic_results %>%
+  mutate(
+    # Cohen_f_Bias = Mean_Cohens_f - S,
+         # Cohen_d_Bias = Mean_Cohens_d * simConfig$cohen_ratio - S,
+         # Package_Bias_const = Mean_RESI_Megan_const - S,
+         # Package_Bias_hc = Mean_RESI_Megan_hc - S,
+         RESI1_Bias_const_signed = Mean_RESI1_const_signed - S,
+         RESI1_Bias_hc_signed = Mean_RESI1_hc_signed - S,
+         RESI1_Bias_const_unsigned = Mean_RESI1_const_unsigned - S,
+         RESI1_Bias_hc_unsigned = Mean_RESI1_hc_unsigned - S,
+         
+         RESI2_Bias_const_signed = Mean_RESI2_const_signed - S,
+         RESI2_Bias_hc_signed = Mean_RESI2_hc_signed - S,
+         RESI2_Bias_const_unsigned = Mean_RESI2_const_unsigned - S,
+         RESI2_Bias_hc_unsigned = Mean_RESI2_hc_unsigned - S) 
+
+long_logistic_bias <- pivot_longer(logistic_bias, 
+                                 cols = contains("_Bias"), 
+                                 names_to = "method",
+                                 values_to = "bias") %>%
+  mutate(
+    label = case_when(
+      str_detect(method, "const") ~ "const",
+      str_detect(method, "hc") ~ "hc",
+      TRUE ~ "other"  
+    ),
+    method_base = str_remove(method, "_(const|hc)$")
+  ) %>%
+  mutate(method = factor(method, levels = c("Cohen_f_Bias", "Cohen_d_Bias", 
+                                            # "Package_Bias_const", "Package_Bias_hc", 
+                                            "RESI1_Bias_const_signed", "RESI1_Bias_hc_signed",
+                                            "RESI1_Bias_const_unsigned", "RESI1_Bias_hc_unsigned",
+                                            "RESI2_Bias_const_signed", "RESI2_Bias_hc_signed",
+                                            "RESI2_Bias_const_unsigned", "RESI2_Bias_hc_unsigned"))) %>%
+  select(model_type, error, S, nsub, S_label, method, bias, label) %>%
+  mutate(S_label = paste0("S[beta] == ", S))
+
+
+bias_label <- c(
+      "RESI1_Bias_const_signed" = "Signed RESI (Param)",
+      "RESI1_Bias_hc_signed"    = "Signed RESI (Robust)",
+      "RESI1_Bias_const_unsigned" = "Unsigned RESI (Param)",
+      "RESI1_Bias_hc_unsigned"    = "Unsigned RESI (Robust)",
+      
+      "RESI2_Bias_const_signed" = "Signed RESI2 (Param)",
+      "RESI2_Bias_hc_signed"    = "Signed RESI2 (Robust)",
+      "RESI2_Bias_const_unsigned" = "Unsigned RESI2 (Param)",
+      "RESI2_Bias_hc_unsigned"    = "Unsigned RESI2 (Robust)",
+      
+      "Cohen_d_Bias"        = "Cohen's d",
+      "Cohen_f_Bias"        = "Cohen's f"
+      # "Package_Bias_const"  = "Package (Param)",
+      # "Package_Bias_hc"     = "Package (HC3)"
+    )
+coverage_label <- c(
+  "Cohens_d_Coverage" = "Cohen's d",
+  "Cohens_f_Coverage" = "Cohen's f",
+  "Coverage1_const_signed" = "Signed RESI (Param)",
+  "Coverage1_hc_signed"    = "Signed RESI (Robust)",
+  "Coverage1_const_unsigned" = "Unsigned RESI (Param)",
+  "Coverage1_hc_unsigned"    = "Unsigned RESI (Robust)",
+  
+  "Coverage2_const_signed" = "Signed RESI (Param)",
+  "Coverage2_hc_signed"    = "Signed RESI (Robust)",
+  "Coverage2_const_unsigned" = "Unsigned RESI (Param)",
+  "Coverage2_hc_unsigned"    = "Unsigned RESI (Robust)"
+)
+
+bias_color <- c(
+  "RESI1_Bias_const_signed" = "#33CC66", 
+  "RESI1_Bias_hc_signed" = "#33CC66", 
+  "RESI1_Bias_const_unsigned" = "#CC33FF", 
+  "RESI1_Bias_hc_unsigned" = "#CC33FF"
+)
+
+coverage_color <- c(
+  "Coverage1_const_signed" = "#33CC66", 
+  "Coverage1_hc_signed" = "#33CC66", 
+  "Coverage1_const_unsigned" = "#CC33FF", 
+  "Coverage1_hc_unsigned" = "#CC33FF"
+)
+
+bias_linetype <- c(
+  "Cohen_f_Bias"       = "solid",
+  "Cohen_d_Bias"       = "solid",
+  # "Package_Bias_const" = "dashed",
+  # "Package_Bias_hc"    = "solid",
+  "RESI1_Bias_const_signed"= "solid",
+  "RESI1_Bias_hc_signed"   = "dashed",
+  "RESI1_Bias_const_unsigned"= "solid",
+  "RESI1_Bias_hc_unsigned"   = "dashed",
+  "RESI2_Bias_const_signed" = "solid", 
+  "RESI2_Bias_hc_signed" = "dashed", 
+  "RESI2_Bias_const_unsigned" = "solid", 
+  "RESI2_Bias_hc_unsigned" = "dashed")
+
+
+coverage_linetype <- c(
+  "Coverage1_const_signed" = "solid", 
+  "Coverage1_hc_signed" = "dashed", 
+  "Coverage1_const_unsigned" = "solid", 
+  "Coverage1_hc_unsigned" = "dashed", 
+  "Coverage2_const_signed" = "solid", 
+  "Coverage2_hc_signed" = "dashed",
+  "Coverage2_const_unsigned" = "solid", 
+  "Coverage2_hc_unsigned" = "dashed",
+  "Cohens_d_Coverage" = "solid",
+  "Cohens_f_Coverage" = "solid"
+)
+
+# Coverage comparison
+long_logistic_coverage <- pivot_longer(logistic_results, 
+                                     cols = contains("Coverage", ignore.case = TRUE), 
+                                     names_to = "method",
+                                     values_to = "coverage") %>%
+  mutate(
+    label = case_when(
+      str_detect(method, "const") ~ "const",
+      str_detect(method, "hc") ~ "hc",
+      TRUE ~ "other"  
+    ),
+    method_base = str_remove(method, "_(const|hc)$")
+  ) %>%
+    select(model_type, error, S, nsub, S_label, method, coverage, label) %>%
+  mutate(S_label = paste0("S[beta] == ", S))
+
+
+p1 <- ggplot(data = long_logistic_bias %>% 
+               filter(method %in% c("RESI1_Bias_const_signed",
+                                    "RESI1_Bias_hc_signed",
+                                    "RESI1_Bias_const_unsigned",
+                                    "RESI1_Bias_hc_unsigned"))) + 
+  geom_line(aes(x = nsub, y = bias, color = method, linetype = method)) + 
+  facet_grid(
+    error ~ S_label,
+      labeller = labeller(S_label = label_parsed, error = label_value)
+  ) + 
+  theme_bw() + 
+  geom_hline(yintercept = 0, linetype = "dotted") + 
+  labs(title = "RESI Bias", 
+       x = "Number of subjects", y = "Bias", color = "Method", 
+       linetype = "Method") + 
+  theme(legend.position = "top") + 
+  scale_x_continuous(breaks = c(100, 500, 1000, 1500), 
+                     guide = guide_axis(angle = 45)) + 
+  scale_color_manual(values = bias_color, labels = bias_label) +
+  scale_linetype_manual(values = bias_linetype, labels = bias_label)
+
+p2 <- ggplot(data = long_logistic_coverage %>%
+               filter(method %in% c("Coverage1_const_signed", 
+                                    "Coverage1_hc_signed",
+                                    "Coverage1_const_unsigned", 
+                                    "Coverage1_hc_unsigned"))) + 
+  geom_line(aes(x = nsub, y = coverage, color = method, linetype = method)) + 
+  facet_grid(
+    error ~ S_label,
+      labeller = labeller(S_label = label_parsed, error = label_value)
+  ) + 
+  theme_bw() + 
+  geom_hline(yintercept = 0.95, linetype = "dotted") +
+  labs(title = "Coverage", 
+       x = "Number of subjects", y = "Coverage", color = "Method", 
+       linetype = "Method") + 
+  scale_x_continuous(breaks = c(100, 500, 1000, 1500), 
+                     guide = guide_axis(angle = 45)) + 
+  theme(legend.position = "top")  +
+  scale_color_manual(values = coverage_color, labels = coverage_label) +
+  scale_linetype_manual(values = coverage_linetype, labels = coverage_label)
+```
+
+
+```{r, fig.width=12, fig.height=5}
+ggarrange(p1, p2, common.legend = T)
+# ggsave("/media/disk2/asymptotic_resi/simulation/simresult_paper/logistic/bias_coverage.png", height = 5, width = 12, dpi = 600)
+```
+
+# Discarded
+
+## Poisson
+
+### const
+
+```{r, eval=TRUE}
+library(parallel) 
+nsim = 1000
+pi = 0.5
+pi2 = 0.25
+mc.cores = 20
+ngroup = 2
+py = 0.5
+
+# generate effect sizes
+# S(v)
+es = c(seq(0, 0.4, length.out=5))
+ns = c(seq(50, 200, by=50), 300, 400, 500, 600, 700, 800)
+simResults = expand.grid(n=ns, S=es)
+
+res_list <- list()
+# Var(E(Y|X)) = Var(Y) - E (Var(Y|X))
+# simulated diagnostic covariate
+for(simInd in 1:nrow(simResults)){
+  # get n and p for this simulation setting
+  n = simResults[simInd, 'n']
+  S = simResults[simInd, 'S']
+  
+  # The simulations assume that the sampling proportions are exactly pi (and 1-pi).
+  # And also that they are not randomly selected across datasets.
+  if(ngroup==2){
+    dx <- rep(0:1, c(n * pi, n-n*pi))
+    beta = S/(pi*(1-pi))
+  } else {
+    dx = factor(rep(0:2, c(n * pi, n*pi2, n *(1-pi-pi2))))
+    beta = S/sqrt(sum(crossprod(scale(model.matrix(~ dx)[,-1], scale=F, center=TRUE)))/n)
+  }
+  cat('\r', c(S, n))
+  
+  
+  res = do.call(rbind, mclapply(1:nsim, function(sim){
+    # simulate the data
+    dx = rbinom(n, 1, prob = pi) 
+    beta = uniroot.all(solve_beta, interval = c(0, 10), S = S, px = 0.5, n = n)[1]
+    lin_pred = rowSums(model.matrix(~ dx)[, -1, drop = FALSE] * beta) 
+    Y = rbinom(n, 1, prob = locfit::expit(lin_pred))
+    dat = data.frame(dx = dx, Y = Y)
+    x = glm(Y ~ dx, data = dat, family = binomial)
+
+    resires = resiParam(x, type = "const")
+    resires
+  }, mc.cores=mc.cores))
+  
+  
+  res_list[[simInd]] = res
+  
+  simResults[simInd,"Mean RESI"] <- mean(res$resi)
+  simResults[simInd,"Mean RESI2"] <- mean(res$resi2)
+  simResults[simInd,"Var RESI"] <- var(res$resi)
+  simResults[simInd,"Var Est"] <- mean(res$resiSE^2)
+  simResults[simInd,"Var sqrt(n)A"] <- var(res$A) * n
+  simResults[simInd,"Var sqrt(n)B"] <- var(res$B) * n
+  simResults[simInd,"EstVar sqrt(n)A"] <- mean(res$Avar)
+  simResults[simInd,"EstVar sqrt(n)B"] <- mean(res$Bvar)
+  simResults[simInd,"Mean A"] <- mean(res$A)
+  simResults[simInd,"Mean B"] <- mean(res$B)
+  simResults[simInd,"Var sqrt(n)phi"] <- var(res$phi) * n
+  simResults[simInd,"EstVar sqrt(n)phi"] <- mean(res$phivar)
+  simResults[simInd,"Mean phi"] <- mean(res$phi)
+  simResults[simInd,"Lcoverage"] <- mean(res$LCI<=S)
+  simResults[simInd,"Ucoverage"] <- mean(res$UCI>=S)
+  simResults[simInd,"coverage"] <- mean(res$LCI<=S & res$UCI>=S)
+}
+
+simResults_para <- simResults
+```
+
+
+# Examples
+## LM
+
+```{r}
+# Simulate small data
+set.seed(22)
+pi = 0.5
+pi2 = 0.25
+
+# generate effect sizes
+S = 0.5
+n = 150
+sigma = sqrt(2)
+
+dx = rbinom(n, 1, prob = pi)
+beta_true = sqrt(1/(pi*(1-pi)))*S * sigma
+Y = rowSums(model.matrix(~ dx)[,-1, drop=FALSE]* beta_true) +
+  matrix(rnorm(n, 0, sigma), nrow=n) # outcome
+dat = data.frame(dx=dx, Y = Y)
+
+fit_lm = lm(Y ~ dx, data=dat)
+model = fit_lm
+X = model.matrix(fit_lm)
+type = "const"
+variable = "dx"
+source("/media/disk2/asymptotic_resi/functions.R")
+# source("test/resiPEse_Th1_bounadry.R") # total derivative, theta = (phi, alpha, beta)
+# source("test/resiPEse_Th2_norm.R") # partial derivative, theta = (phi, alpha, beta)
+source("test/resiPEse_Th1.R") # total derivative, theta = (phi, alpha, beta)
+# source("test/resiPEse_Th2.R") # partial derivative, theta = (phi, alpha, beta)
+anova = TRUE
+
+e <- resid(fit_lm)
+sigma_hat <- summary(fit_lm)$sigma
+
+sigma_S(S = S, X = X, idx = 2, pi = pi, 
+        gamma1 = mean((e - mean(e))^3) / sigma_hat^3,
+        kappa = mean((e - mean(e))^4) / sigma_hat^4,
+        sigma = sigma)
+resiPEse_Th1(fit_lm, variable = "dx")$RESI.SE
+
+
+# resiPEse_Th1(fit_lm, variable = "dx", type = "const", anova = FALSE)
+# resiPEse_Th1(fit_lm, variable = "dx", type = "HC3", anova = FALSE)
+resi_pe(fit_lm, unbiased = FALSE)
+resi_a_lm(model = fit_lm, variable = "dx", type = "HC3")
+resiPEse_Th1(fit_lm, variable = "dx", type = "HC3", unsigned = FALSE)
+
+# const
+type = "const"
+cat("const: \n")
+## true
+cat("true:", sigma^2 * solve(crossprod(X))[2,2]*n, "\n")
+## function
+cat("from Theorem 1:", resiPEse_Th1(fit_lm, variable = "dx", type = type, anova = anova)$Std.Error^2 * n, "\n")
+cat("from Theorem 2:", resiPEse_Th2(fit_lm, variable = "dx", type = type, anova = anova)$Std.Error^2 * n, "\n")
+## model
+cat("from vcov:", vcov(fit_lm)[2,2] *n, "\n")
+cat("\n")
+
+
+# robust
+type = "HC3"
+cat("Robust: \n")
+## true
+cat("true:", sigma^2 * solve(crossprod(X))[2,2]*n, "\n")
+## function
+cat("from Theorem 1:", resiPEse_Th1(fit_lm, variable = "dx", type = type, anova = anova)$Std.Error^2 * n, "\n")
+cat("from Theorem 2:", resiPEse_Th2(fit_lm, variable = "dx", type = type, anova = anova)$Std.Error^2 * n, "\n")
+## model
+cat("from vcovHC:", vcovHC(fit_lm, type)[2,2] *n, "\n")
+```
+
+## GLM
+
+```{r, eval=FALSE}
+set.seed(11)
+
+# simulate the data
+source("/media/disk2/asymptotic_resi/functions.R")
+px <- 0.5
+n = 150
+a <- -2
+S <- 0
+dx = rbinom(n, 1, prob = px)
+beta = uniroot.all(function(beta) S_squared(beta, a=a, px=px) - S^2,
+                  lower = 0, upper = 10)[1]
+lin_pred = rowSums(model.matrix(~ dx)[, -1, drop = FALSE] * beta + a) 
+Y = rbinom(n, 1, prob = locfit::expit(lin_pred))
+fit_glm <- glm(Y ~ dx, family = binomial)
+model <- fit_glm
+variable = "dx"
+type = "HC3"
+# source("test/resiPEse_Th1.R") # total derivative, theta = (phi, alpha, beta)
+# source("test/resiPEse_Th2.R") # partial derivative, theta = (phi, alpha, beta)
+anova = FALSE
+
+# resiPEse_Th1(fit_glm, variable = "dx", type = "const", anova = FALSE)
+# resiPEse_Th1(fit_glm, variable = "dx", type = "HC0", anova = FALSE)
+resi_pe(fit_glm, unbiased = FALSE)
+
+# const
+type = "const"
+cat("const: \n")
+## true
+cat("true:", var_sqrtn_beta_hat(alpha = a, beta = beta, px = px), "\n")
+## function
+cat("from Theorem 1:", resiPEse_Th1(fit_glm, type = type, variable = "dx")$Std.Error^2 * n, "\n")
+cat("from Theorem 2:", resiPEse_Th2(fit_glm, type = type, variable = "dx")$Std.Error^2 * n, "\n")
+## model
+cat("from vcov:", vcov(fit_glm)[2,2] * n, "\n")
+
+
+# const
+type = "HC0"
+cat("Robust: \n")
+## true
+cat("true:", var_sqrtn_beta_hat(alpha = a, beta = beta, px = px), "\n")
+## function
+cat("from Theorem 1:", resiPEse_Th1(fit_glm, type = type, variable = "dx")$Std.Error^2 * n, "\n")
+cat("from Theorem 2:", resiPEse_Th2(fit_glm, type = type, variable = "dx")$Std.Error^2 * n, "\n")
+## model
+cat("from vcovHC:", vcovHC(fit_glm, type)[2,2] * n, "\n")
+```
+
